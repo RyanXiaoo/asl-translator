@@ -1,0 +1,36 @@
+# ===== Python stuff =====
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+env/
+venv/
+.asl-gpu/
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ===== Project data & artifacts =====
+/data/
+/models/
+
+# Distribution
+build/
+dist/
+*.egg-info/
+
+# Logs / plots / checkpoints
+*.log
+*.png
+*.jpg
+*.h5
+*.ckpt
+events.out.tfevents.*
+
+# OS junk
+.DS_Store
+Thumbs.db
