@@ -11,9 +11,10 @@ from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout, BatchNormalization
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.regularizers import l2
-from tensorflow.keras import mixed_precision
 from tensorflow.data import AUTOTUNE
 from tensorflow.keras.optimizers.schedules import CosineDecay
+from tensorflow.keras import layers, Model
+from tensorflow.keras.applications import MobileNetV2
 
 # ───────────────────────────────────────────────────────
 # Parse CLI arguments
@@ -34,7 +35,8 @@ def enable_gpu_growth():
 
 
 def get_datasets(data_dir, img_size=(128,128), batch_size=32):
-    train_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    # 1) load the raw DirectoryDatasets
+    raw_train = tf.keras.preprocessing.image_dataset_from_directory(
         data_dir,
         labels='inferred',
         label_mode='categorical',
@@ -44,7 +46,7 @@ def get_datasets(data_dir, img_size=(128,128), batch_size=32):
         subset='training',
         seed=123,
     )
-    val_ds = tf.keras.preprocessing.image_dataset_from_directory(
+    raw_val = tf.keras.preprocessing.image_dataset_from_directory(
         data_dir,
         labels='inferred',
         label_mode='categorical',
@@ -55,6 +57,10 @@ def get_datasets(data_dir, img_size=(128,128), batch_size=32):
         seed=123,
     )
 
+    # 2) grab class names before you strip them off
+    class_names = raw_train.class_names
+
+    # 3) data‐augmentation pipeline
     data_augmentation = tf.keras.Sequential([
         tf.keras.layers.Resizing(*img_size),
         tf.keras.layers.RandomRotation(0.2),
@@ -65,57 +71,45 @@ def get_datasets(data_dir, img_size=(128,128), batch_size=32):
         tf.keras.layers.Rescaling(1./255),
     ])
 
+    # 4) apply augmentation to the training set
     train_ds = (
-        train_ds
+        raw_train
         .map(lambda x, y: (data_augmentation(x, training=True), y), num_parallel_calls=AUTOTUNE)
         .shuffle(6000)
         .prefetch(AUTOTUNE)
     )
 
+    # 5) normalize the validation set
     val_ds = (
-        val_ds
-        .map(lambda x, y: (x/255.0, y), num_parallel_calls=AUTOTUNE)
+        raw_val
+        .map(lambda x, y: (tf.cast(x, tf.float32)/255.0, y), num_parallel_calls=AUTOTUNE)
         .cache()
         .prefetch(AUTOTUNE)
     )
 
-    return train_ds, val_ds
+    return train_ds, val_ds, class_names
 
 
 def build_model(input_shape=(128,128,3), num_classes=29):
-    model = Sequential([
-        # Block 1: 32 → 32
-        Conv2D(32, 3, activation='relu', padding='same', kernel_regularizer=l2(1e-4),input_shape=input_shape),
-        BatchNormalization(),
-        Conv2D(32, 3, activation='relu', kernel_regularizer=l2(1e-4), padding='same'),
-        BatchNormalization(),
-        MaxPooling2D(),
-        Dropout(0.1),
+    # 1) load the ImageNet‐pretrained base, drop its top
+    base = MobileNetV2(
+        input_shape=input_shape,
+        include_top=False,
+        weights='imagenet',
+        pooling='avg'
+    )
+    base.trainable = False   # freeze for initial training
 
-        # Block 2: 64 → 64
-        Conv2D(64, 3, activation='relu', kernel_regularizer=l2(1e-4), padding='same'),
-        BatchNormalization(),
-        Conv2D(64, 3, activation='relu', kernel_regularizer=l2(1e-4), padding='same'),
-        BatchNormalization(),
-        MaxPooling2D(),
-        Dropout(0.3),
+    # 2) build your new classification head
+    x = layers.Input(shape=input_shape)
+    y = base(x, training=False)
+    y = layers.Dropout(0.3)(y)
+    y = layers.Dense(256, activation='relu')(y)
+    y = layers.BatchNormalization()(y)
+    y = layers.Dropout(0.5)(y)
+    outputs = layers.Dense(num_classes, activation='softmax', dtype='float32')(y)
 
-        # Block 3: 128 → 128
-        Conv2D(128, 3, activation='relu', kernel_regularizer=l2(1e-4), padding='same'),
-        BatchNormalization(),
-        Conv2D(128, 3, activation='relu', kernel_regularizer=l2(1e-4), padding='same'),
-        BatchNormalization(),
-        MaxPooling2D(),
-        Dropout(0.3),
-
-        # head
-        Flatten(),
-        Dense(256, activation='relu'),
-        BatchNormalization(),
-        Dropout(0.5),
-        Dense(num_classes, activation='softmax', dtype='float32'),
-    ])
-    return model
+    return Model(inputs=x, outputs=outputs)
 
 
 
@@ -144,9 +138,10 @@ def main():
     args = parser.parse_args()
 
     enable_gpu_growth()
-    mixed_precision.set_global_policy('mixed_float16')
 
-    train_ds, val_ds = get_datasets(data_dir=args.data_dir, batch_size=args.batch_size)
+    train_ds, val_ds, class_names = get_datasets(data_dir=args.data_dir, batch_size=args.batch_size)
+    num_classes = len(class_names)
+
     n_train = tf.data.experimental.cardinality(train_ds).numpy() * args.batch_size
     n_val   = tf.data.experimental.cardinality(val_ds).numpy() * args.batch_size
     print(f"Training on ~{n_train} images, validating on ~{n_val} images")
@@ -159,9 +154,13 @@ def main():
         decay_steps=total_steps,        # ≈ total training steps
         alpha=1e-4               # final LR ≈ 1e-7
     )
-
-    model = build_model()
     optimizer = tf.keras.optimizers.Adam(learning_rate=schedule)
+
+    model = build_model(input_shape=(128,128,3), num_classes=num_classes)
+
+    for layer in model.layers[1].layers[-20:]:
+        layer.trainable = True
+
     model.compile(
         optimizer=optimizer,
         loss='categorical_crossentropy',
